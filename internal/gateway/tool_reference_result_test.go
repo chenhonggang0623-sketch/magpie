@@ -18,10 +18,12 @@ import (
 // other than the messages sent), and the same result with a text block
 // beside the references is taken. takes is a vendor that reads either.
 type openDesignVendor struct {
-	takes  bool
-	mu     sync.Mutex
-	paths  []string
-	bodies []string
+	takes    bool
+	wordless bool   // answers in a sentence of its own, naming nothing
+	broke    string // answers this message instead, whatever it is sent
+	mu       sync.Mutex
+	paths    []string
+	bodies   []string
 }
 
 func (v *openDesignVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -58,6 +60,12 @@ func (v *openDesignVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	switch {
+	case v.broke != "":
+		w.WriteHeader(422)
+		io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"`+v.broke+`","code":"upstream_error"}}`)
+	case refused && v.wordless:
+		w.WriteHeader(422)
+		io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"Open Design: The request could not be completed.","code":"upstream_error"}}`)
 	case refused:
 		w.WriteHeader(422)
 		io.WriteString(w, "Failed to deserialize the JSON body into the target type: messages[4]: missing field `content` at line 38 column 3")
@@ -232,5 +240,72 @@ func TestRefsSaidLeavesOtherResults(t *testing.T) {
 	if got := string(withRefsSaid([]byte(two))); !strings.Contains(got, `"text":"Tool WebFetch is loaded and can be called now.\nTool WebSearch is loaded and can be called now."`) ||
 		!strings.Contains(got, `{"type":"tool_reference","tool_name":"WebFetch"},{"type":"tool_reference","tool_name":"WebSearch"}`) {
 		t.Errorf("two references went as %s", got)
+	}
+}
+
+// A provider that refuses the bare references in a sentence naming nothing
+// (Open Design's endpoint on 2026-11-13: "Open Design: The request could
+// not be completed.", #2124) gets the same retry: the text before the
+// references, and from then on from the start.
+func TestRefsOnlyRefusedWordlesslyGetsText(t *testing.T) {
+	fresh(t)
+	od := &openDesignVendor{wordless: true}
+	odSrv := httptest.NewServer(od)
+	t.Cleanup(odSrv.Close)
+	if err := provider.Save(provider.Provider{ID: "wordless", Name: "Wordless", Key: "k", Anthropic: odSrv.URL,
+		Models: []string{"deepseek-v4.1-flash"}}); err != nil {
+		t.Fatal(err)
+	}
+	h := New().Handler()
+	for range 2 {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(reporterRefsOnly("wordless/deepseek-v4.1-flash"))))
+		if rec.Code != 200 {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body)
+		}
+	}
+	sent := od.sent()
+	if len(sent) != 3 {
+		t.Fatalf("asked %d times, want the bare references, then the text, then it from the start: %q", len(sent), sent)
+	}
+	if strings.Contains(sent[0], "is loaded and can be called") {
+		t.Fatalf("the first request held the text: %s", sent[0])
+	}
+	for _, got := range sent[1:] {
+		if !strings.Contains(got, `"text": "Tool check is loaded and can be called now."`) && !strings.Contains(got, `"text":"Tool check is loaded and can be called now."`) ||
+			!strings.Contains(got, `"tool_reference"`) || !strings.Contains(got, `"toolu_direct_probe"`) {
+			t.Fatalf("the references went as %s", got)
+		}
+	}
+}
+
+// A 422 that names a limit, an account or a model is about something a
+// text block doesn't mend: nothing is marked, and the next request goes as
+// Claude Code wrote it.
+func TestRefsOnlyRefusedOverSomethingElseLearnsNothing(t *testing.T) {
+	fresh(t)
+	od := &openDesignVendor{broke: "Your credit balance is too low to access the Anthropic API."}
+	odSrv := httptest.NewServer(od)
+	t.Cleanup(odSrv.Close)
+	if err := provider.Save(provider.Provider{ID: "broke", Name: "Broke", Key: "k", Anthropic: odSrv.URL,
+		Models: []string{"deepseek-v4.1-flash"}}); err != nil {
+		t.Fatal(err)
+	}
+	h := New().Handler()
+	for range 2 {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(reporterRefsOnly("broke/deepseek-v4.1-flash"))))
+		if rec.Code != 422 {
+			t.Fatalf("status %d, want the 422 passed on: %s", rec.Code, rec.Body)
+		}
+	}
+	sent := od.sent()
+	if len(sent) != 2 {
+		t.Fatalf("asked %d times, want no retry: %q", len(sent), sent)
+	}
+	for _, got := range sent {
+		if strings.Contains(got, "is loaded and can be called") {
+			t.Fatalf("the references were rewritten over a refusal about something else: %s", got)
+		}
 	}
 }

@@ -72,7 +72,11 @@ import (
 // beside the references. A provider that refuses one is sent each such
 // result with a text block first, saying which tools are loaded, in the
 // words a translated route tells a model (stringOrText); the references and
-// the tool_use/tool_result pairing stay.
+// the tool_use/tool_result pairing stay. Open Design's endpoint as it
+// answers today names none of that: 422 {"type":"invalid_request_error",
+// "message":"Open Design: The request could not be completed."}. A refusal
+// naming nothing this file reads, over a request holding such a result, is
+// taken as being about it, and answered the same way.
 //
 // An endpoint that reads only text and images in a tool_result refuses the
 // references themselves: "DeepSeek V4.1 supports text and image content
@@ -111,6 +115,10 @@ var (
 	// tool_definition)
 	refsNamed    = lazyre.New(`(?i)\b(?:got|unknown|unsupported|not supported|invalid|unexpected|not allowed|not permitted|does ?n[o']t support|cannot|can't)\b[^\n{}]{0,40}\btool_reference\b|\btool_reference\b[^\n{}]{0,40}\b(?:not supported|unsupported|not allowed|not permitted|invalid)`)
 	refsExpected = lazyre.New("(?i)expected [`'\"\\\\]*tool_reference\\b")
+	// a refusal about the account, the model or the request's size, none of
+	// which a text block in a tool_result mends; one of these is not read as
+	// an unnamed refusal of a tool_result's references alone (refuseShapes)
+	refusalElsewhere = lazyre.New(`(?i)\b(?:context|tokens?|length|credits?|quota|balance|billing|payment|rate.?limits?|too.?large|too.?long|maximum|account|api.?key|authenticat\w*|unauthori[sz]ed|forbidden|permission|model|not found|deleted|overloaded|capacity|busy)\b`)
 )
 
 // knownDisplay is a thinking.display every Anthropic endpoint has taken.
@@ -157,6 +165,15 @@ func (s *Server) refuseShapes(p provider.Provider, errBody, body []byte) bool {
 		if hasResultRefs(sent) && !(deferredRefused.Match(errBody) && hasDeferredTools(sent)) {
 			mark(shapeRefs)
 		}
+	}
+	// an endpoint that answers in a sentence of its own, naming nothing
+	// here (Open Design's "The request could not be completed.", #2124):
+	// a request holding a tool_result of references alone is asked again
+	// with the text before them, the part of such a body a refusal magpie
+	// can't read is most likely to be about. One naming a limit, an
+	// account or a model is about something else, and is left as it was.
+	if !fresh && hasRefsOnlyResult(body) && !refusalElsewhere.Match(errBody) {
+		mark(shapeRefsOnly)
 	}
 	// a role refused at a message that is a system one, counted in the
 	// messages as they were sent; a refusal naming a user or assistant
